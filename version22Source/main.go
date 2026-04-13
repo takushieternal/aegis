@@ -1485,6 +1485,9 @@ func apiJoin(w http.ResponseWriter, r *http.Request) {
 					
 					var validMsgs []Message
 					for _, m := range pastMsgs {
+						if m.Platform == "root" {
+							continue
+						}
 						if verifyMessageSignature(m) {
 							validMsgs = append(validMsgs, m)
 						}
