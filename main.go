@@ -4417,7 +4417,6 @@ if (Math.abs(now - msgTime) < 90 * 1000) {
 // Add these two lines to re-enable the menu and prevent syntax errors
 const safeNameJS = (msg.sender_name || msg.sender.substring(0,8)).replace(/'/g, "\\'").replace(/"/g, "&quot;");
 const displaySender = '<span class="text-white font-bold text-sm tracking-wide cursor-pointer hover:underline" onclick="showMemberMenu(event, \'' + msg.sender + '\', \'' + safeNameJS + '\')">' + rawName + rawHash + '</span>';
-                            const displaySender = '<span class="text-white font-bold text-sm tracking-wide">' + rawName + rawHash + '</span>';
                             
                             let isAdmin = false;
                             if (dynamicRoles[msg.sender]) {
