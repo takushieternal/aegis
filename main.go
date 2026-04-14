@@ -4414,6 +4414,9 @@ if (Math.abs(now - msgTime) < 90 * 1000) {
                             
                             const rawName = msg.sender_name ? escapeHTML(msg.sender_name) : escapeHTML(msg.sender.substring(0, 8));
                             const rawHash = msg.sender_name ? '<span class="text-indigo-400/80 text-[10px] ml-0.5">#' + escapeHTML(msg.sender.substring(0, 4)) + '</span>' : '';
+// Add these two lines to re-enable the menu and prevent syntax errors
+const safeNameJS = (msg.sender_name || msg.sender.substring(0,8)).replace(/'/g, "\\'").replace(/"/g, "&quot;");
+const displaySender = '<span class="text-white font-bold text-sm tracking-wide cursor-pointer hover:underline" onclick="showMemberMenu(event, \'' + msg.sender + '\', \'' + safeNameJS + '\')">' + rawName + rawHash + '</span>';
                             const displaySender = '<span class="text-white font-bold text-sm tracking-wide">' + rawName + rawHash + '</span>';
                             
                             let isAdmin = false;
@@ -4559,9 +4562,8 @@ if (Math.abs(now - msgTime) < 90 * 1000) {
             const voiceIcon = isVoice ? '<span class="text-[9px] bg-emerald-500/20 text-emerald-400 px-1 rounded ml-1 border border-emerald-500/30">🎙️</span>' : '';
             const trustedIcon = isTrusted ? '<span class="text-[9px] text-emerald-400 ml-1" title="Trusted Peer">★</span>' : '';
             const shadowBanIcon = isShadowBanned ? '<span class="text-[9px] text-orange-400 ml-1" title="Shadow Banned">👻</span>' : '';
-
-            return '<div onclick="showMemberMenu(event, \''+escapeHTML(m.hash)+'\', \''+escapeHTML(m.name)+'\')" class="flex items-center cursor-pointer hover:bg-slate-800 p-1.5 rounded transition-colors ' + blockStyle + '">' +
-                '<div class="relative">' +
+const safeNameJS = m.name.replace(/'/g, "\\'").replace(/"/g, "&quot;");
+return '<div onclick="showMemberMenu(event, \''+m.hash+'\', \''+safeNameJS+'\')" class="flex items-center cursor-pointer hover:bg-slate-800 p-1.5 rounded transition-colors ' + blockStyle + '">' +                '<div class="relative">' +
                     '<div class="w-8 h-8 bg-indigo-600/80 border border-indigo-500/50 rounded flex items-center justify-center text-sm font-bold text-white mr-3 shadow-inner">' + escapeHTML(initial) + '</div>' +
                     '<div class="absolute -bottom-0.5 -right-0.5 w-3 h-3 ' + statusColor + ' border-2 border-slate-900 rounded-full"></div>' +
                 '</div>' +
