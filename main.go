@@ -4258,10 +4258,11 @@ const htmlTemplate = `<!DOCTYPE html>
                             platformsCache[m.platform].members[m.sender] = 'MEMBER';
                         }
 
-                        const msgTime = new Date(m.timestamp);
-                        if ((now - msgTime) < 45 * 1000) {
-                            newActiveUsers[m.sender] = true;
-                        }
+const msgTime = new Date(m.timestamp);
+// Use Math.abs to allow clocks to be ahead OR behind, expanding the window to 90s
+if (Math.abs(now - msgTime) < 90 * 1000) {
+    newActiveUsers[m.sender] = true;
+}
 						
                         // Calculate unreads and ACKs dynamically
 						if (['TEXT', 'FILE_TICKET'].includes(m.msg_type)) {
@@ -5029,11 +5030,16 @@ const htmlTemplate = `<!DOCTYPE html>
 
         setInterval(() => loadMessages(), 1000);
         
-        setInterval(() => {
-            if (currentPlatform) {
-                apiCall('/api/messages', 'POST', { platform: currentPlatform, text: "ping", msg_type: "PRESENCE" }).catch(()=>{});
-            }
-        }, 30000); 
+setInterval(() => {
+    // Broadcast presence to all known platforms rather than just the active tab
+    Object.keys(platformsCache).forEach(platId => {
+        apiCall('/api/messages', 'POST', { 
+            platform: platId, 
+            text: "ping", 
+            msg_type: "PRESENCE" 
+        }).catch(()=>{});
+    });
+}, 30000);
 
     </script>
 </body>
