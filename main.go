@@ -657,23 +657,20 @@ func apiPing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Fixed: Prevent SSRF by filtering internal IPs during peer discovery
-func isPrivateIP(ip net.IP) bool {
-    privateBlocks := []string{
-        "127.0.0.0/8",    // IPv4 loopback
-        "10.0.0.0/8",     // RFC1918
-        "172.16.0.0/12",  // RFC1918
-        "192.168.0.0/16", // RFC1918
-        "::1/128",        // IPv6 loopback
-        "fe80::/10",      // IPv6 link-local
-    }
-    for _, block := range privateBlocks {
-        _, cidr, _ := net.ParseCIDR(block)
-        if cidr != nil && cidr.Contains(ip) {
-            return true
-        }
-    }
-    return false
+// Fixed: Relaxed SSRF protection to allow Local Area Network (LAN) and Loopback IPs.
+// This ensures cross-platform testing (e.g., Windows and Linux on the same network) works correctly
+// while still blocking malicious scanning of Cloud Metadata endpoints.
+func isRestrictedIP(ip net.IP) bool {
+	restrictedBlocks := []string{
+		"169.254.0.0/16", // AWS/GCP/Azure metadata
+	}
+	for _, block := range restrictedBlocks {
+		_, cidr, _ := net.ParseCIDR(block)
+		if cidr != nil && cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func registerPeer(rawURL string, remoteAddr string, doReverse bool) {
@@ -694,8 +691,8 @@ func registerPeer(rawURL string, remoteAddr string, doReverse bool) {
 
 	ips, err := net.LookupIP(parsed.Hostname())
 	if err == nil && len(ips) > 0 {
-		if isPrivateIP(ips[0]) {
-			fmt.Println("[P2P] Blocked SSRF attempt to private IP:", ips[0])
+		if isRestrictedIP(ips[0]) {
+			fmt.Println("[P2P] Blocked SSRF attempt to cloud metadata IP:", ips[0])
 			return
 		}
 	}
@@ -1711,7 +1708,11 @@ func apiJoin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if validPeerURL == "" {
+		node.mu.RLock()
+		hasRelay := len(node.Peers) > 0
+		node.mu.RUnlock()
+
+		if validPeerURL == "" && !hasRelay {
 			jsonError(w, "Host Unreachable: Both nodes are trapped behind strict NAT firewalls without UPnP (e.g. mobile hotspots). To connect them, run Aegis on a cloud VPS to act as an automatic Mesh Relay.", http.StatusServiceUnavailable)
 			return
 		}
@@ -1727,173 +1728,175 @@ func apiJoin(w http.ResponseWriter, r *http.Request) {
 		node.LastUpdate = time.Now().UnixMilli()
 		node.mu.Unlock()
 
-		go registerPeer(validPeerURL, "", true)
+		if validPeerURL != "" {
+			go registerPeer(validPeerURL, "", true)
 
-		go func(pURL string) {
-			time.Sleep(1 * time.Second)
-			client := http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Get(pURL + "/api/peers")
-			if err == nil && resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				var remotePeers []string
-				if err := json.NewDecoder(resp.Body).Decode(&remotePeers); err == nil {
-					for _, rp := range remotePeers {
-						go registerPeer(rp, "", true)
+			go func(pURL string) {
+				time.Sleep(1 * time.Second)
+				client := http.Client{Timeout: 5 * time.Second}
+				resp, err := client.Get(pURL + "/api/peers")
+				if err == nil && resp.StatusCode == http.StatusOK {
+					defer resp.Body.Close()
+					var remotePeers []string
+					if err := json.NewDecoder(resp.Body).Decode(&remotePeers); err == nil {
+						for _, rp := range remotePeers {
+							go registerPeer(rp, "", true)
+						}
 					}
 				}
-			}
-		}(validPeerURL)
+			}(validPeerURL)
 
-		go func(peerURL, platformID string) {
-			time.Sleep(500 * time.Millisecond) 
-			syncURL := fmt.Sprintf("%s/api/messages?platform=%s&limit=1000", peerURL, platformID)
-			client := http.Client{Timeout: 5 * time.Second}
-			syncResp, err := client.Get(syncURL)
-			
-			if err == nil && syncResp != nil {
-				defer syncResp.Body.Close()
+			go func(peerURL, platformID string) {
+				time.Sleep(500 * time.Millisecond) 
+				syncURL := fmt.Sprintf("%s/api/messages?platform=%s&limit=1000", peerURL, platformID)
+				client := http.Client{Timeout: 5 * time.Second}
+				syncResp, err := client.Get(syncURL)
+				
+				if err == nil && syncResp != nil {
+					defer syncResp.Body.Close()
 
-				limitReader := io.LimitReader(syncResp.Body, 5*1024*1024)
+					limitReader := io.LimitReader(syncResp.Body, 5*1024*1024)
 
-				var pastMsgs []Message
-				if err := json.NewDecoder(limitReader).Decode(&pastMsgs); err == nil {
-					
-					var validMsgs []Message
-					for _, m := range pastMsgs {
-						if verifyMessageSignature(m) {
-							validMsgs = append(validMsgs, m)
-						}
-					}
-
-					node.mu.Lock()
-					changed := false
-					myRootHash := node.Identity.RootHash
-					
-					for _, m := range validMsgs {
+					var pastMsgs []Message
+					if err := json.NewDecoder(limitReader).Decode(&pastMsgs); err == nil {
 						
-						isSenderBanned := false
-						isSenderShadowBanned := false
+						var validMsgs []Message
+						for _, m := range pastMsgs {
+							if verifyMessageSignature(m) {
+								validMsgs = append(validMsgs, m)
+							}
+						}
+
+						node.mu.Lock()
+						changed := false
+						myRootHash := node.Identity.RootHash
 						
-						if plat, platExists := node.Platforms[m.Platform]; platExists {
-							for _, bh := range plat.BannedHashes {
-								if bh == m.Sender { isSenderBanned = true; break }
-							}
-							for _, bh := range plat.ShadowBannedHashes {
-								if bh == m.Sender { isSenderShadowBanned = true; break }
-							}
-						}
-						
-						if isSenderBanned { continue }
-						if isSenderShadowBanned && m.Sender != myRootHash { continue }
-
-						if m.MsgType == "PLATFORM_BAN" && m.Text == myRootHash {
-							foundB := false
-							for _, b := range node.Identity.BannedFrom { if b == m.Platform { foundB = true; break } }
-							if !foundB { node.Identity.BannedFrom = append(node.Identity.BannedFrom, m.Platform) }
-
-							delete(node.Platforms, m.Platform)
-							var filteredMsgs []Message
-							for _, em := range node.Messages {
-								if em.Platform != m.Platform {
-									filteredMsgs = append(filteredMsgs, em)
-								}
-							}
-							m.IsAcked = true
-							filteredMsgs = append(filteredMsgs, m) 
-							node.Messages = filteredMsgs
-							changed = true
-							continue 
-						}
-						
-						if m.MsgType == "PLATFORM_UNBAN" && m.Text == myRootHash {
-							found := -1
-							for i, b := range node.Identity.BannedFrom { if b == m.Platform { found = i; break } }
-							if found >= 0 {
-								node.Identity.BannedFrom = append(node.Identity.BannedFrom[:found], node.Identity.BannedFrom[found+1:]...)
-								changed = true
-							}
-						}
-
-						if m.MsgType == "PLATFORM_BAN" || m.MsgType == "PLATFORM_UNBAN" || m.MsgType == "PLATFORM_SHADOW_BAN" || m.MsgType == "PLATFORM_UNSHADOW_BAN" {
-							if plat, ok := node.Platforms[m.Platform]; ok {
-								isOwner := strings.HasPrefix(m.Platform, "plat_"+m.Sender[:16])
-								role, roleExists := plat.Members[m.Sender]
-								
-								if isOwner || (roleExists && (role == RoleOwner || role == RoleAdmin)) {
-
-									if m.MsgType == "PLATFORM_BAN" {
-										found := -1
-										for i, h := range plat.BannedHashes { if h == m.Text { found = i; break } }
-										if found < 0 { plat.BannedHashes = append(plat.BannedHashes, m.Text) }
-									} else if m.MsgType == "PLATFORM_UNBAN" {
-										found := -1
-										for i, h := range plat.BannedHashes { if h == m.Text { found = i; break } }
-										if found >= 0 { plat.BannedHashes = append(plat.BannedHashes[:found], plat.BannedHashes[found+1:]...) }
-									} else if m.MsgType == "PLATFORM_SHADOW_BAN" {
-										found := -1
-										for i, h := range plat.ShadowBannedHashes { if h == m.Text { found = i; break } }
-										if found < 0 { plat.ShadowBannedHashes = append(plat.ShadowBannedHashes, m.Text) }
-									} else if m.MsgType == "PLATFORM_UNSHADOW_BAN" {
-										found := -1
-										for i, h := range plat.ShadowBannedHashes { if h == m.Text { found = i; break } }
-										if found >= 0 { plat.ShadowBannedHashes = append(plat.ShadowBannedHashes[:found], plat.ShadowBannedHashes[found+1:]...) }
-									}
-									node.Platforms[m.Platform] = plat
-									changed = true
-								}
-							}
-						}
-
-						exists := false
-						for i, existing := range node.Messages {
-							if existing.ID == m.ID {
-								exists = true
-								if m.MsgType == "TOMBSTONE" && existing.MsgType != "TOMBSTONE" {
-									node.Messages[i].MsgType = "TOMBSTONE"
-									node.Messages[i].Text = ""
-									node.Messages[i].FileCID = ""
-									node.Messages[i].Clock.Update(m.Clock)
-									changed = true
-								}
-
-								if len(m.AckedBy) > 0 {
-									merged := make(map[string]bool)
-									for _, a := range existing.AckedBy { merged[a] = true }
-									added := false
-									for _, a := range m.AckedBy {
-										if !merged[a] {
-											merged[a] = true
-											node.Messages[i].AckedBy = append(node.Messages[i].AckedBy, a)
-											added = true
-										}
-									}
-									if added { changed = true }
-								}
-								break
-							}
-						}
-						if !exists {
-							m.IsAcked = true
-							node.Messages = append(node.Messages, m)
-							node.Clock.Update(m.Clock)
-							changed = true
+						for _, m := range validMsgs {
 							
-							if plat, ok := node.Platforms[m.Platform]; ok {
-								if _, memExists := plat.Members[m.Sender]; !memExists {
-									plat.Members[m.Sender] = RoleMember
-									node.Platforms[m.Platform] = plat
+							isSenderBanned := false
+							isSenderShadowBanned := false
+							
+							if plat, platExists := node.Platforms[m.Platform]; platExists {
+								for _, bh := range plat.BannedHashes {
+									if bh == m.Sender { isSenderBanned = true; break }
+								}
+								for _, bh := range plat.ShadowBannedHashes {
+									if bh == m.Sender { isSenderShadowBanned = true; break }
+								}
+							}
+							
+							if isSenderBanned { continue }
+							if isSenderShadowBanned && m.Sender != myRootHash { continue }
+
+							if m.MsgType == "PLATFORM_BAN" && m.Text == myRootHash {
+								foundB := false
+								for _, b := range node.Identity.BannedFrom { if b == m.Platform { foundB = true; break } }
+								if !foundB { node.Identity.BannedFrom = append(node.Identity.BannedFrom, m.Platform) }
+
+								delete(node.Platforms, m.Platform)
+								var filteredMsgs []Message
+								for _, em := range node.Messages {
+									if em.Platform != m.Platform {
+										filteredMsgs = append(filteredMsgs, em)
+									}
+								}
+								m.IsAcked = true
+								filteredMsgs = append(filteredMsgs, m) 
+								node.Messages = filteredMsgs
+								changed = true
+								continue 
+							}
+							
+							if m.MsgType == "PLATFORM_UNBAN" && m.Text == myRootHash {
+								found := -1
+								for i, b := range node.Identity.BannedFrom { if b == m.Platform { found = i; break } }
+								if found >= 0 {
+									node.Identity.BannedFrom = append(node.Identity.BannedFrom[:found], node.Identity.BannedFrom[found+1:]...)
+									changed = true
+								}
+							}
+
+							if m.MsgType == "PLATFORM_BAN" || m.MsgType == "PLATFORM_UNBAN" || m.MsgType == "PLATFORM_SHADOW_BAN" || m.MsgType == "PLATFORM_UNSHADOW_BAN" {
+								if plat, ok := node.Platforms[m.Platform]; ok {
+									isOwner := strings.HasPrefix(m.Platform, "plat_"+m.Sender[:16])
+									role, roleExists := plat.Members[m.Sender]
+									
+									if isOwner || (roleExists && (role == RoleOwner || role == RoleAdmin)) {
+
+										if m.MsgType == "PLATFORM_BAN" {
+											found := -1
+											for i, h := range plat.BannedHashes { if h == m.Text { found = i; break } }
+											if found < 0 { plat.BannedHashes = append(plat.BannedHashes, m.Text) }
+										} else if m.MsgType == "PLATFORM_UNBAN" {
+											found := -1
+											for i, h := range plat.BannedHashes { if h == m.Text { found = i; break } }
+											if found >= 0 { plat.BannedHashes = append(plat.BannedHashes[:found], plat.BannedHashes[found+1:]...) }
+										} else if m.MsgType == "PLATFORM_SHADOW_BAN" {
+											found := -1
+											for i, h := range plat.ShadowBannedHashes { if h == m.Text { found = i; break } }
+											if found < 0 { plat.ShadowBannedHashes = append(plat.ShadowBannedHashes, m.Text) }
+										} else if m.MsgType == "PLATFORM_UNSHADOW_BAN" {
+											found := -1
+											for i, h := range plat.ShadowBannedHashes { if h == m.Text { found = i; break } }
+											if found >= 0 { plat.ShadowBannedHashes = append(plat.ShadowBannedHashes[:found], plat.ShadowBannedHashes[found+1:]...) }
+										}
+										node.Platforms[m.Platform] = plat
+										changed = true
+									}
+								}
+							}
+
+							exists := false
+							for i, existing := range node.Messages {
+								if existing.ID == m.ID {
+									exists = true
+									if m.MsgType == "TOMBSTONE" && existing.MsgType != "TOMBSTONE" {
+										node.Messages[i].MsgType = "TOMBSTONE"
+										node.Messages[i].Text = ""
+										node.Messages[i].FileCID = ""
+										node.Messages[i].Clock.Update(m.Clock)
+										changed = true
+									}
+
+									if len(m.AckedBy) > 0 {
+										merged := make(map[string]bool)
+										for _, a := range existing.AckedBy { merged[a] = true }
+										added := false
+										for _, a := range m.AckedBy {
+											if !merged[a] {
+												merged[a] = true
+												node.Messages[i].AckedBy = append(node.Messages[i].AckedBy, a)
+												added = true
+											}
+										}
+										if added { changed = true }
+									}
+									break
+								}
+							}
+							if !exists {
+								m.IsAcked = true
+								node.Messages = append(node.Messages, m)
+								node.Clock.Update(m.Clock)
+								changed = true
+								
+								if plat, ok := node.Platforms[m.Platform]; ok {
+									if _, memExists := plat.Members[m.Sender]; !memExists {
+										plat.Members[m.Sender] = RoleMember
+										node.Platforms[m.Platform] = plat
+									}
 								}
 							}
 						}
+						if changed {
+							node.LastUpdate = time.Now().UnixMilli()
+						}
+						node.mu.Unlock()
+						if changed { saveLocalDB() }
 					}
-					if changed {
-						node.LastUpdate = time.Now().UnixMilli()
-					}
-					node.mu.Unlock()
-					if changed { saveLocalDB() }
 				}
-			}
-		}(validPeerURL, payload.PlatformID)
+			}(validPeerURL, payload.PlatformID)
+		}
 
 		saveLocalDB()
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
